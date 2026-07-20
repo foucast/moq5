@@ -103,6 +103,15 @@ uint32_t moq_rcbuf_refcount(const moq_rcbuf_t *buf);
  */
 typedef struct moq_stream_ref { uint64_t _v; } moq_stream_ref_t;
 
+/* -- Subscription/publication handles (types.h) -----------------------
+ * Fixed-width opaque handles, passed by value. Declared early since
+ * several later declarations (the SUBSCRIBE_REQUEST event variant,
+ * moq_session_subscribe, moq_session_accept_subscribe,
+ * moq_session_send_object_datagram) all reference moq_subscription_t.
+ */
+typedef struct moq_subscription { uint64_t _opaque; } moq_subscription_t;
+typedef struct moq_publication  { uint64_t _opaque; } moq_publication_t;
+
 /* -- Perspective / session state (session.h) ------------------------
  * Real C enums -- declared with their literal values exactly as the
  * header defines them (no "..." needed; enums are fully expressible in
@@ -230,22 +239,34 @@ typedef struct {
 void moq_action_cleanup(moq_action_t *action);
 
 /* -- Events (session.h) ----------------------------------------------
- * Not exercised by the accompanying acceptance test: every session
- * there is facade-owned from creation (moq_pub_tick/moq_sub_tick drain
- * and dispatch events internally), and MoQ5's own sequencing rule --
- * raw poll_events must not also be called on a session once a facade
- * owns its tick() -- means this binding's Python code never calls raw
- * poll_events on a facade-owned session. Declared here only so the
- * function surface is bound and callable; kept minimal (no event-kind
- * variants) since nothing here reads a raw event's payload. A raw
- * accept-path that polls events BEFORE handing a session to a facade
- * (needed to read a caller-chosen value out of a SUBSCRIBE request
- * before accepting it) would need to extend this with the specific
- * variant it reads -- intentionally not added here, to avoid binding
- * surface beyond what this module actually exercises.
+ * Kept minimal: only the one variant actually read is declared
+ * (SUBSCRIBE_REQUEST, needed by the raw accept-with-pinned-alias path
+ * -- see the "Raw session calls" section below). This event is only
+ * ever polled BEFORE a facade takes ownership of a session's tick():
+ * once a facade owns tick() (moq_pub_tick/moq_sub_tick drain and
+ * dispatch events internally), calling raw poll_events on that same
+ * session would double-consume against the facade -- MoQ5's own
+ * sequencing rule. Other event-kind variants are not declared; add
+ * them here if and when something needs to read one.
  */
+typedef uint32_t moq_event_kind_t;
+
+#define MOQ_EVENT_SUBSCRIBE_REQUEST ...
+
 typedef struct {
-    uint32_t kind;
+    moq_subscription_t sub;
+    moq_bytes_t         track_name;
+    ...;
+} moq_subscribe_request_event_t;
+
+union moq_event_detail {
+    moq_subscribe_request_event_t subscribe_request;
+    ...;
+};
+
+typedef struct {
+    moq_event_kind_t        kind;
+    union moq_event_detail  u;
     ...;
 } moq_event_t;
 
@@ -262,6 +283,27 @@ typedef uint8_t moq_object_status_t;
  * needed since this binding never sets .filter explicitly.
  */
 typedef uint32_t moq_subscribe_filter_t;
+
+/* -- Raw subscribe (session.h) ---------------------------------------
+ * moq_session_subscribe is the raw (non-facade) counterpart to
+ * moq_sub_subscribe. Needed so a peer session can issue a real
+ * SUBSCRIBE without going through the Subscriber facade at all --
+ * keeping the whole accept/pin/encode path at the raw session level,
+ * for symmetry and because the encode call under test
+ * (moq_session_send_object_datagram) is itself raw, not facade.
+ */
+typedef struct {
+    moq_namespace_t track_namespace;
+    moq_bytes_t     track_name;
+    ...;
+} moq_subscribe_cfg_t;
+
+void moq_subscribe_cfg_init(moq_subscribe_cfg_t *cfg);
+
+moq_result_t moq_session_subscribe(moq_session_t *s,
+                                    const moq_subscribe_cfg_t *cfg,
+                                    uint64_t now_us,
+                                    moq_subscription_t *out_handle);
 
 /* ==================================================================
  * Publisher facade (publisher.h)
@@ -380,22 +422,13 @@ void moq_sub_object_cleanup(moq_sub_object_t *obj);
 
 /* ==================================================================
  * Raw session calls for caller-controlled subscribe acceptance
- * (session.h) -- bound for completeness of the Core Session API
- * surface, not exercised by the accompanying single-subscriber
- * acceptance test. These matter once more than one downstream session
- * needs BYTE-IDENTICAL encoded output for the same object: the facade's
- * own accept path (moq_pub_add_track's accept-decision callback) does
- * not expose a way to pin track_alias, but moq_session_accept_subscribe
- * plus moq_accept_subscribe_cfg_t does -- track_alias is the one
- * session-scoped field in an OBJECT_DATAGRAM (per draft-16), so pinning
- * it identically across sessions is what makes a single encoded buffer
- * reusable across all of them. A single downstream session has no such
- * requirement, which is why MOQ_PUB_ACCEPT_ALL's auto-accept is
- * correct and sufficient for the accompanying test.
+ * (session.h). track_alias is the one session-scoped field in an
+ * OBJECT_DATAGRAM (per draft-16), so pinning it identically across
+ * sessions via moq_accept_subscribe_cfg_t is what makes a single
+ * encoded buffer reusable across multiple downstream sessions -- the
+ * facade's own accept path (moq_pub_add_track's accept-decision
+ * callback) does not expose a way to set it at all.
  * ================================================================== */
-typedef struct moq_subscription { uint64_t _opaque; } moq_subscription_t;
-typedef struct moq_publication  { uint64_t _opaque; } moq_publication_t;
-
 typedef struct {
     bool     has_track_alias;
     uint64_t track_alias;

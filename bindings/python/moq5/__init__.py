@@ -215,6 +215,37 @@ class Session:
             lib.moq_action_cleanup(ffi.addressof(buf[i]))
         return results
 
+    def raw_subscribe(self, namespace_parts, track_name: bytes, now_us):
+        """Issue a raw (non-facade) SUBSCRIBE -- the counterpart to
+        RawAcceptSession's accept-with-pinned-alias path on the peer
+        side. Returns the moq_subscription_t handle (unused by the
+        caller in the common case; moq_session_subscribe requires an
+        out-parameter regardless).
+
+        This exists alongside the Subscriber facade's own .subscribe()
+        because RawAcceptSession's accept counterpart is deliberately
+        raw-only throughout (see RawAcceptSession's docstring for why
+        the facade cannot be used on that side) -- keeping both ends of
+        that exchange at the same (raw) level, rather than mixing a
+        facade-driven peer against a raw-only acceptor.
+        """
+        cfg = ffi.new("moq_subscribe_cfg_t *")
+        lib.moq_subscribe_cfg_init(cfg)
+        ns, ns_keepalive = _make_namespace(namespace_parts)
+        name_view, name_keepalive = _make_bytes(track_name)
+        cfg.track_namespace = ns[0]
+        cfg.track_name = name_view[0]
+        if not hasattr(self, "_raw_keepalive"):
+            self._raw_keepalive = []
+        self._raw_keepalive.append((ns, ns_keepalive, name_view, name_keepalive))
+
+        out = ffi.new("moq_subscription_t *")
+        _check(
+            lib.moq_session_subscribe(self._ptr, cfg, now_us, out),
+            "moq_session_subscribe",
+        )
+        return out[0]
+
     def destroy(self):
         if not self._destroyed:
             lib.moq_session_destroy(self._ptr)
@@ -389,6 +420,206 @@ class Subscriber:
         if not self._destroyed:
             lib.moq_sub_destroy(self._ptr)
             self._destroyed = True
+
+    def __del__(self):
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+
+class SubscribeAcceptState:
+    """States for RawAcceptSession's one-way accept sequencing gate."""
+
+    PENDING_ACCEPT = "PENDING_ACCEPT"
+    ACCEPTED = "ACCEPTED"
+
+
+class RawAcceptSession:
+    """A raw session that accepts exactly one incoming SUBSCRIBE with a
+    caller-pinned track_alias, entirely at the raw session level -- no
+    Publisher facade involved anywhere in this class.
+
+    Why raw-only rather than raw-accept-then-facade: MoQ5's Publisher
+    facade discovers subscribers by polling SUBSCRIBE_REQUEST events
+    itself, inside its own tick() (moq_pub_tick's own doc comment:
+    "dispatches subscribe requests"). If this class's
+    poll_for_subscribe_request() drains that event first -- which it
+    must, to read the pending subscription handle before deciding how
+    to accept it -- there is nothing left in the queue for a facade
+    created afterward to discover. Checked directly against the header:
+    publisher.h has no function anywhere that takes a moq_subscription_t
+    or a track_alias parameter, confirming there is no bridge from a
+    raw-accepted subscription into the facade's own track/subscriber
+    bookkeeping. Since moq_session_send_object_datagram (the call this
+    exists to drive) is itself a raw call, not a facade one, staying
+    raw-only throughout avoids needing that bridge at all: no
+    Publisher, no moq_pub_add_track, no has_subscriber -- just the
+    session, the accepted subscription handle, and direct calls to the
+    raw encode function.
+
+    States: PENDING_ACCEPT -> ACCEPTED, one-way. accept() is illegal
+    before a SUBSCRIBE_REQUEST has actually been found, and both
+    poll_for_subscribe_request() and accept() are illegal once already
+    ACCEPTED -- a given instance manages exactly one accepted
+    subscription for its whole lifetime. This is enforced by raising,
+    not left to caller discipline, matching the same reasoning as the
+    sequencing guarantee this class exists to implement in the first
+    place: a hazard worth preventing mechanically is worth preventing
+    mechanically in its own guard code too.
+    """
+
+    def __init__(self, perspective, now_us=0):
+        self.session = Session(perspective, now_us)
+        self.state = SubscribeAcceptState.PENDING_ACCEPT
+        self.sub_handle = None
+        self.sub_track_name = None
+
+    def tick(self, now_us):
+        self.session.tick(now_us)
+
+    def feed_control(self, data: bytes, now_us):
+        self.session.feed_control(data, now_us)
+
+    def feed_datagram(self, data: bytes, now_us):
+        self.session.feed_datagram(data, now_us)
+
+    def poll_actions(self, cap=16):
+        return self.session.poll_actions(cap)
+
+    def poll_for_subscribe_request(self, cap=8):
+        """Poll raw events looking for MOQ_EVENT_SUBSCRIBE_REQUEST.
+        Only legal in PENDING_ACCEPT. Returns True once a request has
+        been found (remembering its handle/track_name for accept() to
+        use), False otherwise -- safe to call repeatedly across ticks
+        until it returns True. Any other event kind encountered along
+        the way is drained and cleaned up without interpretation; this
+        class only cares about the one event type it exists to find.
+
+        IMPORTANT: the polled event's .u.subscribe_request.sub field
+        must be COPIED out explicitly here, not simply assigned. cffi's
+        nested struct/union field access (event -> union -> nested
+        struct -> field) returns a view into the enclosing
+        moq_event_t[cap] array's own backing memory, not an
+        independent copy -- even though moq_subscription_t is a small
+        value type ({ uint64_t _opaque; }), not a pointer. Once `buf`
+        below goes out of scope (or once a later ffi.new() call, e.g.
+        inside poll_actions(), reuses that same memory), a bare
+        assignment of self.sub_handle = ev.u.subscribe_request.sub
+        would silently start reflecting whatever now occupies that
+        memory: symptom is the handle's _opaque value reading back as
+        0 after any intervening poll_actions() call, and
+        moq_session_send_object_datagram failing with
+        MOQ_ERR_STALE_HANDLE despite nothing re-assigning the Python
+        attribute. The fix below uses cffi's copy-construct idiom --
+        ffi.new("moq_subscription_t *", <existing cdata>) -- which
+        allocates fresh, Python-owned memory and performs a memberwise
+        copy into it, independent of the event array's lifetime. This
+        stays correct automatically if this struct's fields ever
+        change, with no per-field maintenance.
+        """
+        if self.state != SubscribeAcceptState.PENDING_ACCEPT:
+            raise RuntimeError(
+                f"poll_for_subscribe_request() is only legal in "
+                f"PENDING_ACCEPT (current state: {self.state})"
+            )
+        if self.sub_handle is not None:
+            return True
+
+        buf = ffi.new(f"moq_event_t[{cap}]")
+        n = lib.moq5_shim_poll_events(self.session.ptr, buf, cap)
+        found = False
+        for i in range(n):
+            ev = buf[i]
+            if ev.kind == lib.MOQ_EVENT_SUBSCRIBE_REQUEST and self.sub_handle is None:
+                copied_handle = ffi.new("moq_subscription_t *", ev.u.subscribe_request.sub)
+                self.sub_handle = copied_handle[0]
+                self.sub_track_name = bytes(
+                    ffi.buffer(
+                        ev.u.subscribe_request.track_name.data,
+                        ev.u.subscribe_request.track_name.len,
+                    )
+                )
+                found = True
+            lib.moq_event_cleanup(ffi.addressof(buf[i]))
+        return found
+
+    def accept(self, track_alias: int, now_us):
+        """Accept the pending SUBSCRIBE with a pinned track_alias.
+        Transitions PENDING_ACCEPT -> ACCEPTED, permanently. Illegal if
+        no request has been found yet (call
+        poll_for_subscribe_request() first and confirm it returned
+        True), or if this session has already accepted one."""
+        if self.state != SubscribeAcceptState.PENDING_ACCEPT:
+            raise RuntimeError(
+                f"accept() is only legal in PENDING_ACCEPT "
+                f"(current state: {self.state})"
+            )
+        if self.sub_handle is None:
+            raise RuntimeError(
+                "accept() called with no pending SUBSCRIBE_REQUEST -- "
+                "call poll_for_subscribe_request() first and confirm it "
+                "returned True"
+            )
+        cfg = ffi.new("moq_accept_subscribe_cfg_t *")
+        lib.moq_accept_subscribe_cfg_init(cfg)
+        cfg.has_track_alias = True
+        cfg.track_alias = track_alias
+        _check(
+            lib.moq_session_accept_subscribe(
+                self.session.ptr, self.sub_handle, cfg, now_us
+            ),
+            "moq_session_accept_subscribe",
+        )
+        self.state = SubscribeAcceptState.ACCEPTED
+
+    def send_object_datagram(
+        self,
+        group_id,
+        object_id,
+        payload: bytes,
+        now_us,
+        publisher_priority=0,
+        end_of_group=False,
+    ):
+        """Encode and queue one object datagram against the accepted
+        subscription, via the raw moq_session_send_object_datagram
+        call under test. Only legal once ACCEPTED. May be called
+        multiple times (ACCEPTED is not single-shot -- only the
+        PENDING_ACCEPT -> ACCEPTED transition itself is one-way)."""
+        if self.state != SubscribeAcceptState.ACCEPTED:
+            raise RuntimeError(
+                f"send_object_datagram() is only legal in ACCEPTED "
+                f"(current state: {self.state})"
+            )
+        alloc = default_alloc()
+        rcbuf_out = ffi.new("moq_rcbuf_t **")
+        _check(
+            lib.moq_rcbuf_create(alloc, payload, len(payload), rcbuf_out),
+            "moq_rcbuf_create",
+        )
+        buf = rcbuf_out[0]
+        try:
+            _check(
+                lib.moq_session_send_object_datagram(
+                    self.session.ptr,
+                    self.sub_handle,
+                    group_id,
+                    object_id,
+                    publisher_priority,
+                    end_of_group,
+                    buf,
+                    ffi.NULL,
+                    0,
+                    now_us,
+                ),
+                "moq_session_send_object_datagram",
+            )
+        finally:
+            lib.moq_rcbuf_decref(buf)
+
+    def destroy(self):
+        self.session.destroy()
 
     def __del__(self):
         try:
