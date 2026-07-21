@@ -74,6 +74,48 @@ def default_alloc():
     return lib.moq_alloc_default()
 
 
+def make_shared_payload(data: bytes):
+    """Build one moq_rcbuf_t from `data`, for reuse across multiple
+    RawAcceptSession.send_object_datagram_shared() calls (e.g. fanning
+    the same object out to N downstream sessions) instead of each
+    session independently creating an identical buffer from the same
+    bytes.
+
+    Returns an opaque handle the caller owns; call
+    release_shared_payload() on it exactly once when done reusing it,
+    regardless of how many sessions it was sent to in between (each
+    send_object_datagram_shared() call increfs/decrefs its own use
+    internally -- this call's reference is separate and always needs
+    releasing).
+
+    Only safe to share across sessions that all live in one shard
+    (thread/event loop) -- moq_rcbuf_t's own refcounting is documented
+    as non-atomic. A caller spread across multiple threads needs
+    moq_rcbuf_clone() per destination shard instead, which this helper
+    does not provide.
+    """
+    alloc = default_alloc()
+    rcbuf_out = ffi.new("moq_rcbuf_t **")
+    _check(
+        lib.moq_rcbuf_create(alloc, data, len(data), rcbuf_out),
+        "moq_rcbuf_create",
+    )
+    return rcbuf_out[0]
+
+
+def release_shared_payload(shared_payload):
+    """Release the caller's own reference to a handle obtained from
+    make_shared_payload(), once done reusing it across sends."""
+    lib.moq_rcbuf_decref(shared_payload)
+
+
+def shared_payload_refcount(shared_payload) -> int:
+    """Current refcount of a handle from make_shared_payload(). Mainly
+    useful for tests/diagnostics confirming incref/decref pairs balance
+    out correctly rather than leaking or double-freeing."""
+    return int(lib.moq_rcbuf_refcount(shared_payload))
+
+
 def _make_bytes(data: bytes):
     """Build a moq_bytes_t borrowing from a copy of `data`.
 
@@ -595,7 +637,14 @@ class RawAcceptSession:
         subscription, via the raw moq_session_send_object_datagram
         call under test. Only legal once ACCEPTED. May be called
         multiple times (ACCEPTED is not single-shot -- only the
-        PENDING_ACCEPT -> ACCEPTED transition itself is one-way)."""
+        PENDING_ACCEPT -> ACCEPTED transition itself is one-way).
+
+        This creates a fresh moq_rcbuf_t from `payload` every call --
+        the right choice for a single destination, but wasteful when
+        the SAME bytes need to go to multiple sessions (N independent
+        allocations and copies of identical data). For that case, see
+        make_shared_payload() and send_object_datagram_shared() below.
+        """
         if self.state != SubscribeAcceptState.ACCEPTED:
             raise RuntimeError(
                 f"send_object_datagram() is only legal in ACCEPTED "
@@ -626,6 +675,56 @@ class RawAcceptSession:
             )
         finally:
             lib.moq_rcbuf_decref(buf)
+
+    def send_object_datagram_shared(
+        self,
+        group_id,
+        object_id,
+        shared_payload,
+        now_us,
+        publisher_priority=0,
+        end_of_group=False,
+    ):
+        """Like send_object_datagram(), but takes an already-built
+        payload handle (from make_shared_payload()) instead of raw
+        bytes, so multiple sessions can reuse ONE allocation/copy of
+        the same object instead of each independently re-creating an
+        identical buffer. Increfs before the send and decrefs after --
+        the caller keeps its own reference from make_shared_payload()
+        and is responsible for releasing that one separately, once,
+        via release_shared_payload(), after every session that needs
+        it has been sent to.
+
+        Only safe when every session sharing the same handle lives in
+        one shard (thread/event loop): moq_rcbuf_t's own refcounting is
+        documented as non-atomic. A relay spread across multiple
+        threads would need moq_rcbuf_clone() per destination shard
+        instead -- not what this method does.
+        """
+        if self.state != SubscribeAcceptState.ACCEPTED:
+            raise RuntimeError(
+                f"send_object_datagram_shared() is only legal in ACCEPTED "
+                f"(current state: {self.state})"
+            )
+        ref = lib.moq_rcbuf_incref(shared_payload)
+        try:
+            _check(
+                lib.moq_session_send_object_datagram(
+                    self.session.ptr,
+                    self.sub_handle,
+                    group_id,
+                    object_id,
+                    publisher_priority,
+                    end_of_group,
+                    ref,
+                    ffi.NULL,
+                    0,
+                    now_us,
+                ),
+                "moq_session_send_object_datagram",
+            )
+        finally:
+            lib.moq_rcbuf_decref(ref)
 
     def destroy(self):
         self.session.destroy()
