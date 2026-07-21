@@ -207,8 +207,17 @@ class Session:
                 )
                 results.append({"kind": "send_datagram", "data": data})
             elif a.kind == lib.MOQ_ACTION_CLOSE_SESSION:
+                reason_bytes = (
+                    bytes(ffi.buffer(a.u.close_session.reason.data, a.u.close_session.reason.len))
+                    if a.u.close_session.reason.len > 0
+                    else b""
+                )
                 results.append(
-                    {"kind": "close_session", "code": int(a.u.close_session.code)}
+                    {
+                        "kind": "close_session",
+                        "code": int(a.u.close_session.code),
+                        "reason": reason_bytes,
+                    }
                 )
             else:
                 results.append({"kind": "other", "raw_kind": int(a.kind)})
