@@ -205,6 +205,23 @@ class Session:
             "moq_session_on_control_bytes",
         )
 
+    def feed_data(self, stream_id: int, data: bytes, fin: bool, now_us):
+        """Feed bytes received on a data (object-delivery) stream.
+
+        stream_ref is adapter-assigned and opaque to MoQ5 -- we use
+        the QUIC stream_id directly as the _v value, since it uniquely
+        identifies the stream and stays consistent across calls.
+        MoQ5 only uses stream_ref as a lookup key; it never interprets
+        the value itself."""
+        stream_ref = ffi.new("moq_stream_ref_t *")
+        stream_ref._v = stream_id
+        _check(
+            lib.moq_session_on_data_bytes(
+                self._ptr, stream_ref[0], data, len(data), fin, now_us
+            ),
+            "moq_session_on_data_bytes",
+        )
+
     def feed_datagram(self, data: bytes, now_us):
         _check(
             lib.moq_session_on_datagram(self._ptr, data, len(data), now_us),
@@ -224,14 +241,10 @@ class Session:
         for why this doesn't call moq_session_poll_actions directly).
 
         Returns a list of dicts. Kinds interpreted: send_control,
-        send_datagram, close_session. Anything else is reported as
+        send_datagram, send_data (stream-mode object/subgroup-header
+        delivery), close_session. Anything else is reported as
         {"kind": "other", "raw_kind": <int>} and cleaned up without
-        further interpretation -- this binding's usage (datagram-mode
-        object delivery under draft-16's shared control stream) does
-        not expect to see SEND_DATA/OPEN_*/RESET_*/STOP_* actions; if one
-        appears, surfacing it as "other" rather than silently dropping
-        it makes an unexpected action visible to test/debugging code
-        rather than hidden.
+        further interpretation.
         """
         buf = ffi.new(f"moq_action_t[{cap}]")
         n = lib.moq5_shim_poll_actions(self._ptr, buf, cap)
@@ -248,6 +261,30 @@ class Session:
                     ffi.buffer(a.u.send_datagram.data, a.u.send_datagram.len)
                 )
                 results.append({"kind": "send_datagram", "data": data})
+            elif a.kind == lib.MOQ_ACTION_SEND_DATA:
+                header_bytes = bytes(
+                    ffi.buffer(a.u.send_data.header, a.u.send_data.header_len)
+                )
+                payload_bytes = b""
+                if a.u.send_data.payload != ffi.NULL:
+                    payload_bytes = bytes(
+                        ffi.buffer(
+                            lib.moq_rcbuf_data(a.u.send_data.payload),
+                            lib.moq_rcbuf_len(a.u.send_data.payload),
+                        )
+                    )
+                results.append(
+                    {
+                        "kind": "send_data",
+                        # header + payload concatenated: the full wire
+                        # bytes for this stream chunk (Subgroup Header
+                        # framing, or a continuation of one, followed by
+                        # whatever object bytes belong with it).
+                        "data": header_bytes + payload_bytes,
+                        "stream_ref": int(a.u.send_data.stream_ref._v),
+                        "fin": bool(a.u.send_data.fin),
+                    }
+                )
             elif a.kind == lib.MOQ_ACTION_CLOSE_SESSION:
                 reason_bytes = (
                     bytes(ffi.buffer(a.u.close_session.reason.data, a.u.close_session.reason.len))
@@ -532,6 +569,9 @@ class RawAcceptSession:
     def feed_control(self, data: bytes, now_us):
         self.session.feed_control(data, now_us)
 
+    def feed_data(self, stream_id: int, data: bytes, fin: bool, now_us):
+        self.session.feed_data(stream_id, data, fin, now_us)
+
     def feed_datagram(self, data: bytes, now_us):
         self.session.feed_datagram(data, now_us)
 
@@ -725,6 +765,89 @@ class RawAcceptSession:
             )
         finally:
             lib.moq_rcbuf_decref(ref)
+
+    def open_subgroup(self, group_id, subgroup_id, now_us, publisher_priority=0, end_of_group=False):
+        """Open a new subgroup on the accepted subscription -- the
+        stream-mode (reliable=True) counterpart to
+        send_object_datagram(). Returns an opaque subgroup handle;
+        write_object() one or more times against it, then
+        close_subgroup() when done (typically: one subgroup per Group,
+        multiple objects written within it as they arrive, closed when
+        the Group ends or a new one starts).
+
+        object_properties is not exposed here -- this binding's usage
+        writes plain objects with no properties; extend if a caller
+        ever needs them."""
+        if self.state != SubscribeAcceptState.ACCEPTED:
+            raise RuntimeError(
+                f"open_subgroup() is only legal in ACCEPTED (current state: {self.state})"
+            )
+        cfg = ffi.new("moq_subgroup_cfg_t *")
+        lib.moq_subgroup_cfg_init(cfg)
+        cfg.group_id = group_id
+        cfg.subgroup_id = subgroup_id
+        cfg.publisher_priority = publisher_priority
+        cfg.end_of_group = end_of_group
+        out = ffi.new("moq_subgroup_handle_t *")
+        _check(
+            lib.moq_session_open_subgroup(self.session.ptr, self.sub_handle, cfg, now_us, out),
+            "moq_session_open_subgroup",
+        )
+        return out[0]
+
+    def write_object(self, subgroup, object_id, payload: bytes, now_us):
+        """Write one object into an already-open subgroup. May be
+        called multiple times against the same subgroup handle."""
+        if self.state != SubscribeAcceptState.ACCEPTED:
+            raise RuntimeError(
+                f"write_object() is only legal in ACCEPTED (current state: {self.state})"
+            )
+        alloc = default_alloc()
+        rcbuf_out = ffi.new("moq_rcbuf_t **")
+        _check(
+            lib.moq_rcbuf_create(alloc, payload, len(payload), rcbuf_out),
+            "moq_rcbuf_create",
+        )
+        buf = rcbuf_out[0]
+        try:
+            _check(
+                lib.moq_session_write_object(self.session.ptr, subgroup, object_id, buf, now_us),
+                "moq_session_write_object",
+            )
+        finally:
+            lib.moq_rcbuf_decref(buf)
+
+    def write_object_shared(self, subgroup, object_id, shared_payload, now_us):
+        """Like write_object(), but takes an already-built payload
+        handle (from make_shared_payload()) instead of raw bytes --
+        the stream-mode counterpart to send_object_datagram_shared(),
+        for reusing one encode across N subgroups (across N sessions)
+        instead of each independently re-creating an identical buffer.
+        Same shard/thread-safety caveat as send_object_datagram_shared()
+        applies here identically."""
+        if self.state != SubscribeAcceptState.ACCEPTED:
+            raise RuntimeError(
+                f"write_object_shared() is only legal in ACCEPTED (current state: {self.state})"
+            )
+        ref = lib.moq_rcbuf_incref(shared_payload)
+        try:
+            _check(
+                lib.moq_session_write_object(self.session.ptr, subgroup, object_id, ref, now_us),
+                "moq_session_write_object",
+            )
+        finally:
+            lib.moq_rcbuf_decref(ref)
+
+    def close_subgroup(self, subgroup, now_us):
+        """Close a subgroup previously opened with open_subgroup()."""
+        if self.state != SubscribeAcceptState.ACCEPTED:
+            raise RuntimeError(
+                f"close_subgroup() is only legal in ACCEPTED (current state: {self.state})"
+            )
+        _check(
+            lib.moq_session_close_subgroup(self.session.ptr, subgroup, now_us),
+            "moq_session_close_subgroup",
+        )
 
     def destroy(self):
         self.session.destroy()

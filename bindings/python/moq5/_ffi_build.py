@@ -452,6 +452,42 @@ moq_result_t moq_session_send_object_datagram(
     const uint8_t *properties, size_t properties_len,
     uint64_t now_us);
 
+/* -- Subgroup lifecycle (session.h) -----------------------------------
+ * Stream-mode (reliable=True) counterpart to the raw datagram path
+ * above. Wire delivery for subgroup data uses the SAME MOQ_ACTION_SEND_DATA
+ * action kind already declared above (moq_send_data_action_t) -- no new
+ * action-union member needed; only these new lifecycle functions and
+ * their supporting types.
+ */
+typedef struct moq_subgroup_handle { uint64_t _opaque; } moq_subgroup_handle_t;
+
+typedef struct {
+    uint64_t group_id;
+    uint64_t subgroup_id;
+    uint8_t  publisher_priority;
+    bool     object_properties;
+    bool     end_of_group;
+    ...;
+} moq_subgroup_cfg_t;
+
+void moq_subgroup_cfg_init(moq_subgroup_cfg_t *cfg);
+
+moq_result_t moq_session_open_subgroup(moq_session_t *s,
+                                        moq_subscription_t sub,
+                                        const moq_subgroup_cfg_t *cfg,
+                                        uint64_t now_us,
+                                        moq_subgroup_handle_t *out_handle);
+
+moq_result_t moq_session_write_object(moq_session_t *s,
+                                       moq_subgroup_handle_t subgroup,
+                                       uint64_t object_id,
+                                       moq_rcbuf_t *payload,
+                                       uint64_t now_us);
+
+moq_result_t moq_session_close_subgroup(moq_session_t *s,
+                                         moq_subgroup_handle_t subgroup,
+                                         uint64_t now_us);
+
 /* -- Shim re-exports (see SHIM_SOURCE below) -------------------------- */
 size_t moq5_shim_poll_actions(moq_session_t *s, moq_action_t *out, size_t cap);
 size_t moq5_shim_poll_events(moq_session_t *s, moq_event_t *out, size_t cap);
